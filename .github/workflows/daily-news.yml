@@ -1,13 +1,13 @@
 name: news-digest
 
+# Полностью автономно: запускается на серверах GitHub по расписанию.
+# Компьютер может быть выключен, ничего локально запускать не нужно.
+
 on:
   schedule:
     - cron: '0 5 * * *'    # 08:00 МСК — утренний дайджест
     - cron: '0 17 * * *'   # 20:00 МСК — вечерний дайджест
   workflow_dispatch:        # ручной запуск из вкладки Actions
-
-permissions:
-  contents: write           # нужно, чтобы коммитить seen.json обратно в репозиторий
 
 concurrency:
   group: news-digest
@@ -28,20 +28,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Восстанавливаем память об уже отправленных новостях из кэша.
+      # Если кэша ещё нет — используется засеянный seen.json из репозитория.
+      - name: Restore seen state
+        uses: actions/cache/restore@v4
+        with:
+          path: seen.json
+          key: seen-state-${{ github.run_id }}
+          restore-keys: |
+            seen-state-
+
       - name: Send digest
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python news_bot.py
 
-      - name: Persist seen state
-        run: |
-          if ! git diff --quiet -- seen.json; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add seen.json
-            git commit -m "chore: update seen state [skip ci]"
-            git push
-          else
-            echo "seen.json без изменений — коммит не нужен"
-          fi
+      # Сохраняем обновлённую память в кэш для следующего запуска.
+      # Ключ уникален (run_id), поэтому сохранение всегда проходит.
+      - name: Save seen state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen.json
+          key: seen-state-${{ github.run_id }}
