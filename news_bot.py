@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
+"""Лёгкий дайджест ИТ-новостей из трёх источников.
+
+Формат каждой новости: заголовок + одна фраза сути + ссылка на источник.
+Отправляет в тот же Telegram-канал через того же бота, что и раньше.
+Помнит уже отправленное (seen.json), поэтому в канал попадают только новые новости.
+"""
 import argparse
+import html
+import json
 import os
 import re
+import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
+from time import mktime
 from typing import List, Dict, Optional
 
 import feedparser
@@ -11,144 +22,263 @@ import requests
 from bs4 import BeautifulSoup
 
 
+# --- Источники --------------------------------------------------------------
 FEEDS: List[Dict[str, str]] = [
-    {"name": "Reuters Business", "url": "https://feeds.feedburner.com/Reuters/businessNews", "category": "Бизнес"},
-    {"name": "TechCrunch", "url": "https://techcrunch.com/feed/", "category": "ИТ"},
-    {"name": "Hacker News", "url": "https://hnrss.org/frontpage", "category": "ИТ"},
-    {"name": "Search Engine Land", "url": "https://searchengineland.com/feed", "category": "Маркетинг"},
-    {"name": "Marketing Brew", "url": "https://www.marketingbrew.com/rss.xml", "category": "Маркетинг"},
-    {"name": "CNews", "url": "https://www.cnews.ru/inc/rss/news.xml", "category": "РФ ИТ"},
-    {"name": "TAdviser", "url": "https://www.tadviser.ru/rss.xml", "category": "РФ ИТ"},
-    {"name": "РБК", "url": "https://www.rbc.ru/rss/v2/asia/?utm_source=rss", "category": "РФ Бизнес"},
+    {"name": "CNews", "url": "https://www.cnews.ru/inc/rss/news.xml"},
+    {"name": "TAdviser", "url": "https://www.tadviser.ru/xml/tadviser.xml"},
+    {"name": "НовостиИТ-канала", "url": "https://www.novostiitkanala.ru/rss"},
 ]
 
-SAMPLE_ITEMS: List[Dict[str, str]] = [
-    {
-        "title": "Microsoft и OpenAI усиливают давление на рынок корпоративного ИИ",
-        "summary": "Крупные вендоры расширяют корпоративные предложения и меняют правила закупок для предприятий.",
-        "link": "https://example.com/ai-enterprise",
-        "category": "ИТ",
-    },
-    {
-        "title": "Новые правила регулирования данных влияют на модели монетизации SaaS",
-        "summary": "Изменения в регулировании подталкивают компании к пересмотру тарифов и архитектуры данных.",
-        "link": "https://example.com/regulation-saas",
-        "category": "Бизнес",
-    },
-    {
-        "title": "Маркетинг в ИТ снова выходит на короткие форматы и AI-ассистентов",
-        "summary": "Команды используют генеративный ИИ для контента и персонализации в реальном времени.",
-        "link": "https://example.com/it-marketing",
-        "category": "Маркетинг",
-    },
-]
+STATE_FILE = "seen.json"          # список уже отправленных новостей (коммитится экшеном)
+SEEN_KEEP = 1500                  # сколько id хранить в памяти, чтобы файл не рос бесконечно
+RECENCY_DAYS = 3                  # игнорируем новости старше N дней (защита от потопа)
+MAX_ITEMS_PER_RUN = 60            # предохранитель на один запуск
+TG_LIMIT = 3800                   # безопасный лимит длины одного сообщения Telegram (макс. 4096)
+PHRASE_MAX = 240                  # максимальная длина «одной фразы»
+MSK = timezone(timedelta(hours=3))
+
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 
 
-def strip_tags(text: Optional[str]) -> str:
+# --- Загрузка (requests, при сбое — curl) -----------------------------------
+def fetch_url(url: str, timeout: int = 20) -> Optional[bytes]:
+    """Возвращает содержимое URL. Сначала requests, при ошибке — системный curl.
+
+    Фолбэк на curl нужен на локальном macOS: системный Python собран со старым
+    LibreSSL и не может открыть некоторые сайты (TAdviser). В CI работает requests.
+    """
+    try:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as exc:
+        print(f"  requests не смог ({url}): {exc}; пробую curl", file=sys.stderr)
+    try:
+        out = subprocess.run(
+            ["curl", "-sSL", "--max-time", str(timeout), "-A", USER_AGENT, url],
+            capture_output=True, timeout=timeout + 5,
+        )
+        if out.returncode == 0 and out.stdout:
+            return out.stdout
+        print(f"  curl не смог ({url}): rc={out.returncode}", file=sys.stderr)
+    except Exception as exc:
+        print(f"  curl упал ({url}): {exc}", file=sys.stderr)
+    return None
+
+
+# --- Текстовые помощники -----------------------------------------------------
+def clean_text(text: Optional[str]) -> str:
     if not text:
         return ""
     plain = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    plain = html.unescape(plain)
     return re.sub(r"\s+", " ", plain).strip()
 
 
-def clean_title(title: Optional[str]) -> str:
-    title = strip_tags(title)
-    title = re.sub(r"\s+", " ", title).strip()
-    return title
+def first_sentence(text: str, max_len: int = PHRASE_MAX) -> str:
+    """Первое предложение — «одна фраза сути»."""
+    text = clean_text(text)
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    phrase = parts[0].strip() if parts else text
+    # если первое «предложение» подозрительно короткое (обрезалось на инициале и т.п.) —
+    # добавляем следующее
+    if len(phrase) < 30 and len(parts) > 1:
+        phrase = (phrase + " " + parts[1]).strip()
+    if len(phrase) > max_len:
+        phrase = phrase[: max_len - 1].rstrip() + "…"
+    return phrase
 
 
-def make_relevance_note(item: Dict[str, str]) -> str:
-    category = item.get("category", "")
-    if "Маркетинг" in category:
-        return "Это влияет на каналы привлечения, контент-стратегию и расходы на рост."
-    if "ИТ" in category or "РФ ИТ" in category:
-        return "Это влияет на инфраструктуру, закупки, скорость развития продуктов и конкуренцию."
-    if "Бизнес" in category or "РФ Бизнес" in category:
-        return "Это влияет на расходы, регулирование и устойчивость бизнеса."
-    return "Это может изменить приоритеты, риски и планы развития в ближайшие месяцы."
+# --- Модель новости ----------------------------------------------------------
+def entry_id(entry, link: str) -> str:
+    return (getattr(entry, "id", "") or getattr(entry, "guid", "") or link).strip()
 
 
-def make_thesis(item: Dict[str, str]) -> str:
-    title = clean_title(item.get("title"))
-    summary = clean_title(item.get("summary"))
-
-    if summary:
-        thesis = summary
-    else:
-        thesis = title
-
-    if len(thesis) > 220:
-        thesis = thesis[:217].rstrip() + "..."
-
-    return f"Ключевая мысль: {thesis}\nПочему это важно: {make_relevance_note(item)}\nИсточник: {item.get('link', '')}"
+def entry_timestamp(entry) -> int:
+    for attr in ("published_parsed", "updated_parsed"):
+        value = getattr(entry, attr, None)
+        if value:
+            try:
+                return int(mktime(value))
+            except Exception:
+                continue
+    return 0
 
 
-def fetch_feed_items(feed: Dict[str, str], limit: int = 5) -> List[Dict[str, str]]:
-    parsed = feedparser.parse(feed["url"])
-    items: List[Dict[str, str]] = []
+JUNK_PHRASE_PREFIXES = ("основная статья", "см.", "см ", "смотрите также", "содержание")
 
-    for entry in parsed.entries[:limit]:
-        title = clean_title(getattr(entry, "title", ""))
-        summary = clean_title(getattr(entry, "summary", "") or getattr(entry, "description", ""))
-        link = getattr(entry, "link", "") or feed["url"]
 
+def _norm(text: str) -> str:
+    return re.sub(r"\W+", "", text.lower())
+
+
+def make_phrase(entry, title: str) -> str:
+    """Одна фраза сути — из описания RSS. Если описания нет или оно просто
+    повторяет заголовок, фразу не показываем (заголовок говорит сам за себя)."""
+    desc = getattr(entry, "summary", "") or getattr(entry, "description", "")
+    phrase = first_sentence(desc)
+    if len(phrase) < 20:
+        return ""
+    low = phrase.lower()
+    if any(low.startswith(prefix) for prefix in JUNK_PHRASE_PREFIXES):
+        return ""  # вики-ссылки TAdviser вроде «Основная статья: …»
+    if _norm(phrase) == _norm(title) or _norm(phrase) in _norm(title):
+        return ""
+    return phrase
+
+
+def should_include(item: Dict) -> bool:
+    """Точка расширения для будущего фильтра.
+
+    Сейчас пропускаем все новые новости. Когда понадобится отсекать по темам/
+    ключевым словам — вся логика фильтра живёт здесь (одно место).
+    """
+    return True
+
+
+def fetch_feed(feed: Dict[str, str]) -> List[Dict]:
+    content = fetch_url(feed["url"])
+    if not content:
+        print(f"Пропускаю {feed['name']}: не удалось загрузить ленту", file=sys.stderr)
+        return []
+    parsed = feedparser.parse(content)
+    items: List[Dict] = []
+    for entry in parsed.entries:
+        title = clean_text(getattr(entry, "title", ""))
         if not title:
             continue
-
+        link = (getattr(entry, "link", "") or feed["url"]).strip()
         items.append(
             {
+                "id": entry_id(entry, link),
                 "title": title,
-                "summary": summary,
                 "link": link,
-                "category": feed["category"],
+                "source": feed["name"],
+                "ts": entry_timestamp(entry),
+                "_entry": entry,  # временно, для ленивого расчёта фразы
             }
         )
-
     return items
 
 
-def collect_news(limit: int = 12) -> List[Dict[str, str]]:
-    items: List[Dict[str, str]] = []
+# --- Память отправленного ----------------------------------------------------
+def load_seen(path: str = STATE_FILE) -> List[str]:
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return list(data.get("seen", []))
+    except Exception as exc:
+        print(f"Не смог прочитать {path}: {exc}", file=sys.stderr)
+        return []
+
+
+def save_seen(seen: List[str], path: str = STATE_FILE) -> None:
+    seen = seen[-SEEN_KEEP:]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"seen": seen}, fh, ensure_ascii=False, indent=0)
+
+
+def collect_new(seen_ids: List[str], limit: int = MAX_ITEMS_PER_RUN) -> List[Dict]:
+    seen = set(seen_ids)
+    now = time.time()
+    window = RECENCY_DAYS * 24 * 3600
+
+    raw: List[Dict] = []
     for feed in FEEDS:
         try:
-            items.extend(fetch_feed_items(feed, limit=3))
+            raw.extend(fetch_feed(feed))
         except Exception as exc:
-            print(f"Skipping {feed['name']}: {exc}", file=sys.stderr)
+            print(f"Пропускаю {feed['name']}: {exc}", file=sys.stderr)
 
-    seen = set()
-    unique: List[Dict[str, str]] = []
-    for item in sorted(items, key=lambda x: x.get("title", "").lower()):
-        key = (item.get("title", "").lower(), item.get("link", ""))
-        if key in seen:
+    fresh: List[Dict] = []
+    seen_now = set()
+    for item in sorted(raw, key=lambda x: x["ts"], reverse=True):
+        if item["id"] in seen or item["id"] in seen_now:
             continue
-        seen.add(key)
-        unique.append(item)
+        if item["ts"] and (now - item["ts"] > window):
+            continue
+        if not should_include(item):
+            continue
+        seen_now.add(item["id"])
+        fresh.append(item)
 
-    return unique[:limit]
+    return fresh[:limit]
 
 
-def build_digest(items: List[Dict[str, str]]) -> str:
-    today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
-    lines = [f"📰 Дайджест новостей за {today}", ""]
+# --- Форматирование и отправка ----------------------------------------------
+def part_of_day() -> str:
+    hour = datetime.now(MSK).hour
+    return "утро" if 4 <= hour < 15 else "вечер"
+
+
+def format_item(item: Dict) -> str:
+    title = html.escape(item["title"])
+    phrase = html.escape(make_phrase(item["_entry"], item["title"]))
+    src = html.escape(item["source"])
+    link = html.escape(item["link"], quote=True)
+    block = f"🔹 <b>{title}</b>"
+    if phrase:
+        block += f"\n{phrase}"
+    block += f'\n<a href="{link}">{src} →</a>'
+    return block
+
+
+def pack_messages(items: List[Dict]) -> List[str]:
+    now = datetime.now(MSK).strftime("%d.%m")
+    header = f"📰 <b>Дайджест ИТ-новостей</b> · {part_of_day()} · {now}"
+
+    messages: List[str] = []
+    current = header
     for item in items:
-        title = clean_title(item.get("title"))
-        lines.append(title)
-        lines.append(make_thesis(item))
-        lines.append("")
-    return "\n".join(lines).strip()
+        block = format_item(item)
+        if len(current) + len(block) + 2 > TG_LIMIT:
+            messages.append(current)
+            current = block
+        else:
+            current += "\n\n" + block
+    if current.strip():
+        messages.append(current)
+    return messages
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    response = requests.post(url, data=payload, timeout=30)
-    response.raise_for_status()
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    resp = requests.post(url, data=payload, timeout=30)
+    resp.raise_for_status()
+
+
+# --- Окружение и запуск ------------------------------------------------------
+def load_env_file(filepath: str = ".env") -> None:
+    if not os.path.isfile(filepath):
+        return
+    with open(filepath, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and key not in os.environ:
+                os.environ[key] = value
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Daily news digest bot")
-    parser.add_argument("--limit", type=int, default=10, help="How many items to include")
-    parser.add_argument("--dry-run", action="store_true", help="Print digest without sending to Telegram")
+    load_env_file()
+    parser = argparse.ArgumentParser(description="Дайджест ИТ-новостей из трёх источников")
+    parser.add_argument("--dry-run", action="store_true", help="Показать дайджест, не отправляя в Telegram")
+    parser.add_argument("--seed", action="store_true", help="Отметить все текущие новости как отправленные (без отправки) — запустить один раз при старте")
+    parser.add_argument("--limit", type=int, default=MAX_ITEMS_PER_RUN, help="Максимум новостей за запуск")
     parser.add_argument("--token", default=os.getenv("TELEGRAM_BOT_TOKEN", ""), help="Telegram bot token")
     parser.add_argument("--chat-id", default=os.getenv("TELEGRAM_CHAT_ID", ""), help="Telegram chat id")
     return parser.parse_args()
@@ -156,28 +286,45 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    seen_ids = load_seen()
 
-    if args.dry_run:
-        items = SAMPLE_ITEMS
-    else:
-        items = collect_news(limit=args.limit)
+    if args.seed:
+        ids: List[str] = list(seen_ids)
+        for feed in FEEDS:
+            for item in fetch_feed(feed):
+                if item["id"] not in ids:
+                    ids.append(item["id"])
+        save_seen(ids)
+        print(f"Готово: отмечено как отправленное {len(ids)} новостей. Теперь бот будет слать только новые.")
+        return 0
 
-    if not items:
-        print("No news items found.", file=sys.stderr)
-        return 1
+    new_items = collect_new(seen_ids, limit=args.limit)
+    print(f"Новых новостей: {len(new_items)}")
 
-    digest = build_digest(items)
-    print(digest)
+    if not new_items:
+        print("Новых новостей нет — ничего не отправляю.")
+        return 0
+
+    messages = pack_messages(new_items)
+
+    for msg in messages:
+        print("\n" + "=" * 60)
+        print(msg)
 
     if args.dry_run:
         return 0
 
     if not args.token or not args.chat_id:
-        print("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set to send messages.", file=sys.stderr)
+        print("TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID должны быть заданы для отправки.", file=sys.stderr)
         return 2
 
-    send_telegram_message(args.token, args.chat_id, digest)
-    print("Sent digest to Telegram.")
+    for msg in messages:
+        send_telegram_message(args.token, args.chat_id, msg)
+        time.sleep(1)
+
+    # запоминаем отправленное только после успешной отправки
+    save_seen(seen_ids + [item["id"] for item in new_items])
+    print(f"Отправлено сообщений: {len(messages)}, новостей: {len(new_items)}.")
     return 0
 
 
