@@ -15,11 +15,13 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 from time import mktime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+
+import news_filter
 
 
 # --- Источники --------------------------------------------------------------
@@ -129,13 +131,15 @@ def make_phrase(entry, title: str) -> str:
     return phrase
 
 
-def should_include(item: Dict) -> bool:
-    """Точка расширения для будущего фильтра.
+def should_include(item: Dict) -> Tuple[bool, str]:
+    """Тематический фильтр: пропускать ли новость в дайджест.
 
-    Сейчас пропускаем все новые новости. Когда понадобится отсекать по темам/
-    ключевым словам — вся логика фильтра живёт здесь (одно место).
+    Сами правила живут в news_filter.py — там же их можно проверить командой
+    `python3 news_filter.py --check`, не запуская рассылку. Возвращаем ещё и
+    причину отсева, чтобы в логе GitHub Actions было видно, что и почему не дошло.
     """
-    return True
+    phrase = make_phrase(item["_entry"], item["title"])
+    return news_filter.classify(item["title"], phrase)
 
 
 def fetch_feed(feed: Dict[str, str]) -> List[Dict]:
@@ -182,7 +186,12 @@ def save_seen(seen: List[str], path: str = STATE_FILE) -> None:
         json.dump({"seen": seen}, fh, ensure_ascii=False, indent=0)
 
 
-def collect_new(seen_ids: List[str], limit: int = MAX_ITEMS_PER_RUN) -> List[Dict]:
+def collect_new(seen_ids: List[str], limit: int = MAX_ITEMS_PER_RUN) -> Tuple[List[Dict], List[str]]:
+    """Возвращает (новости для дайджеста, id отсеянных фильтром).
+
+    Отсеянные тоже помечаем прочитанными: иначе бот будет разбирать и печатать
+    один и тот же мусор в каждом запуске все три дня, пока новость свежая.
+    """
     seen = set(seen_ids)
     now = time.time()
     window = RECENCY_DAYS * 24 * 3600
@@ -195,18 +204,27 @@ def collect_new(seen_ids: List[str], limit: int = MAX_ITEMS_PER_RUN) -> List[Dic
             print(f"Пропускаю {feed['name']}: {exc}", file=sys.stderr)
 
     fresh: List[Dict] = []
+    filtered: List[Tuple[str, str, str]] = []
     seen_now = set()
     for item in sorted(raw, key=lambda x: x["ts"], reverse=True):
         if item["id"] in seen or item["id"] in seen_now:
             continue
         if item["ts"] and (now - item["ts"] > window):
             continue
-        if not should_include(item):
+        keep, reason = should_include(item)
+        if not keep:
+            filtered.append((item["id"], item["title"], reason))
+            seen_now.add(item["id"])   # мусор помечаем прочитанным, чтобы не разбирать его снова
             continue
         seen_now.add(item["id"])
         fresh.append(item)
 
-    return fresh[:limit]
+    if filtered:
+        print(f"Отсеяно фильтром: {len(filtered)}")
+        for _, title, reason in filtered:
+            print(f"  ✗ [{reason}] {title[:90]}")
+
+    return fresh[:limit], [fid for fid, _, _ in filtered]
 
 
 # --- Форматирование и отправка ----------------------------------------------
@@ -298,11 +316,13 @@ def main() -> int:
         print(f"Готово: отмечено как отправленное {len(ids)} новостей. Теперь бот будет слать только новые.")
         return 0
 
-    new_items = collect_new(seen_ids, limit=args.limit)
+    new_items, filtered_ids = collect_new(seen_ids, limit=args.limit)
     print(f"Новых новостей: {len(new_items)}")
 
     if not new_items:
         print("Новых новостей нет — ничего не отправляю.")
+        if filtered_ids:
+            save_seen(seen_ids + filtered_ids)
         return 0
 
     messages = pack_messages(new_items)
@@ -323,7 +343,7 @@ def main() -> int:
         time.sleep(1)
 
     # запоминаем отправленное только после успешной отправки
-    save_seen(seen_ids + [item["id"] for item in new_items])
+    save_seen(seen_ids + filtered_ids + [item["id"] for item in new_items])
     print(f"Отправлено сообщений: {len(messages)}, новостей: {len(new_items)}.")
     return 0
 
