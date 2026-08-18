@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
+from difflib import SequenceMatcher
 from time import mktime
 from typing import List, Dict, Optional, Tuple
 
@@ -35,6 +36,7 @@ STATE_FILE = "seen.json"          # список уже отправленных
 SEEN_KEEP = 1500                  # сколько id хранить в памяти, чтобы файл не рос бесконечно
 RECENCY_DAYS = 3                  # игнорируем новости старше N дней (защита от потопа)
 MAX_ITEMS_PER_RUN = 60            # предохранитель на один запуск
+DUPLICATE_RATIO = 0.88            # порог схожести заголовков, выше которого это одна новость
 TG_LIMIT = 3800                   # безопасный лимит длины одного сообщения Telegram (макс. 4096)
 PHRASE_MAX = 240                  # максимальная длина «одной фразы»
 MSK = timezone(timedelta(hours=3))
@@ -227,6 +229,37 @@ def collect_new(seen_ids: List[str], limit: int = MAX_ITEMS_PER_RUN) -> Tuple[Li
     return fresh[:limit], [fid for fid, _, _ in filtered]
 
 
+def merge_duplicates(items: List[Dict]) -> List[Dict]:
+    """Склеивает одну новость из разных лент в один блок с несколькими ссылками.
+
+    CNews и «Новости ИТ-канала» часто печатают один пресс-релиз, и заголовки
+    расходятся мелочью: регистром названия («Sense» против «SENSE»), хвостом,
+    сокращением. Поэтому сравниваем не строки, а нормализованные заголовки —
+    точное совпадение или похожесть выше DUPLICATE_RATIO.
+
+    Побеждает первый по свежести; остальные отдают ему свою ссылку, а их id
+    возвращаются в `dupe_ids`, чтобы отметиться прочитанными вместе с ним.
+    """
+    merged: List[Dict] = []
+    keys: List[str] = []
+    for item in items:
+        key = _norm(item["title"])
+        item["sources"] = [(item["source"], item["link"])]
+        item["dupe_ids"] = []
+        for idx, known in enumerate(keys):
+            if key != known and SequenceMatcher(None, key, known).ratio() < DUPLICATE_RATIO:
+                continue
+            target = merged[idx]
+            if item["source"] not in [name for name, _ in target["sources"]]:
+                target["sources"].append((item["source"], item["link"]))
+            target["dupe_ids"].append(item["id"])
+            break
+        else:
+            merged.append(item)
+            keys.append(key)
+    return merged
+
+
 # --- Форматирование и отправка ----------------------------------------------
 def part_of_day() -> str:
     hour = datetime.now(MSK).hour
@@ -236,12 +269,14 @@ def part_of_day() -> str:
 def format_item(item: Dict) -> str:
     title = html.escape(item["title"])
     phrase = html.escape(make_phrase(item["_entry"], item["title"]))
-    src = html.escape(item["source"])
-    link = html.escape(item["link"], quote=True)
     block = f"🔹 <b>{title}</b>"
     if phrase:
         block += f"\n{phrase}"
-    block += f'\n<a href="{link}">{src} →</a>'
+    sources = item.get("sources") or [(item["source"], item["link"])]
+    block += "\n" + " · ".join(
+        f'<a href="{html.escape(link, quote=True)}">{html.escape(name)} →</a>'
+        for name, link in sources
+    )
     return block
 
 
@@ -317,6 +352,10 @@ def main() -> int:
         return 0
 
     new_items, filtered_ids = collect_new(seen_ids, limit=args.limit)
+    before_merge = len(new_items)
+    new_items = merge_duplicates(new_items)
+    if before_merge != len(new_items):
+        print(f"Склеено перепечаток: {before_merge - len(new_items)}")
     print(f"Новых новостей: {len(new_items)}")
 
     if not new_items:
@@ -342,8 +381,11 @@ def main() -> int:
         send_telegram_message(args.token, args.chat_id, msg)
         time.sleep(1)
 
-    # запоминаем отправленное только после успешной отправки
-    save_seen(seen_ids + filtered_ids + [item["id"] for item in new_items])
+    # запоминаем отправленное только после успешной отправки — вместе с id
+    # перепечаток, иначе склеенный дубль прилетит отдельной новостью в следующий раз
+    sent_ids = [item["id"] for item in new_items]
+    sent_ids += [dupe for item in new_items for dupe in item.get("dupe_ids", [])]
+    save_seen(seen_ids + filtered_ids + sent_ids)
     print(f"Отправлено сообщений: {len(messages)}, новостей: {len(new_items)}.")
     return 0
 

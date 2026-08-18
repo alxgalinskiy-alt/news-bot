@@ -1,6 +1,6 @@
 #!/bin/zsh
 set -e
-cd /Users/alexandr/telegram-news-bot
+cd /Users/alexandr/Claude/telegram-news-bot
 
 if [ -f .env ]; then
   set -a
